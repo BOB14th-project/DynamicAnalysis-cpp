@@ -1,4 +1,6 @@
 # 결과물
+/.venv/
+/.vscode/
 /bin/
 /build/
 events.ndjson

@@ -1,124 +1,166 @@
-// agent.js — EVP init 계열에서 "키 길이"만 기록 (NDJSON)
-// 1) 메인 모듈의 import(PLT/GOT)에서 바로 attach (가장 확실)
-// 2) libcrypto.so.3 의 export 에도 attach 시도
-// 3) 덤프: 메인 모듈 import 중 EVP_*Init* 이름 전부 기록 (디버깅)
-
+// agent.js (compat + robust)
 const OUTPUT_PATH = "%OUTPUT_FILE_PATH%" || "events.ndjson";
-const FUNCS = [
-  "EVP_EncryptInit_ex",
-  "EVP_EncryptInit",
+const CAND_LIBS = ["libcrypto.so.3", "libcrypto.so.1.1"];
+const FUNCS_TO_HOOK = [
   "EVP_EncryptInit_ex2",
+  "EVP_EncryptInit_ex",
   "EVP_CipherInit_ex",
-  "EVP_CipherInit"
+  "EVP_CIPHER_CTX_set_key_length",
 ];
 
-let f;
-try { f = new File(OUTPUT_PATH, "a"); } catch { f = new File("/tmp/openssl_events.ndjson", "a"); }
+// ---- logging ----
+let f; try { f = new File(OUTPUT_PATH, "a"); } catch { f = new File("/tmp/openssl_events.ndjson", "a"); }
 const now = () => new Date().toISOString();
 const write = (o) => { try { f.write(JSON.stringify(o) + "\n"); f.flush(); } catch (_) {} };
-const info  = (obj) => { obj.ts = now(); obj.event = obj.event || "info"; write(obj); };
-const warn  = (msg) => write({ ts: now(), event: "warn", message: msg });
+const info  = (o) => write(Object.assign({ ts: now(), event: "info" }, o));
+const warn  = (msg) => write({ ts: now(), event: "warn", message: String(msg) });
 
-function mainModule() {
+// ---- export resolver (구/신 Frida 호환) ----
+function resolveExport(name) {
+  // 0) 전역 익스포트 우선
   try {
-    if (typeof Process.enumerateModulesSync === 'function') return Process.enumerateModulesSync()[0];
-    if (typeof Process.enumerateModules === 'function') return Process.enumerateModules()[0];
-  } catch {}
+    const g = Module.findExportByName(null, name);
+    if (g) return g;
+  } catch (_) {}
+
+  // 1) libcrypto.* 에서 찾기 (get/find 모두 대응)
+  for (const lib of CAND_LIBS) {
+    let m = null;
+    try {
+      if (typeof Process.findModuleByName === "function") {
+        m = Process.findModuleByName(lib);      // 신버전
+      } else if (typeof Process.getModuleByName === "function") {
+        m = Process.getModuleByName(lib);       // 구버전 (없으면 throw)
+      }
+    } catch (_) { m = null; }
+
+    if (!m) continue;
+    try {
+      const a = Module.findExportByName(m.name, name);
+      if (a) return a;
+    } catch (_) {}
+  }
+
+  // 2) ApiResolver('module') 와일드카드
+  try {
+    const resolver = new ApiResolver("module");
+    const pats = [`exports:libcrypto*.so!*${name}`, `exports:*!${name}`];
+    for (const p of pats) {
+      try {
+        const matches = resolver.enumerateMatchesSync(p);
+        if (matches && matches.length) return matches[0].address;
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  // 3) DebugSymbol fallback (PLT/심볼만 있을 때)
+  try {
+    const dbg = DebugSymbol.fromName(name).address;
+    if (dbg) return dbg;
+  } catch (_) {}
+
   return null;
 }
 
-function enumerateImports(mname) {
-  try {
-    if (typeof Module.enumerateImportsSync === 'function') return Module.enumerateImportsSync(mname);
-  } catch {}
-  const out = [];
-  try {
-    if (typeof Module.enumerateImports === 'function') {
-      Module.enumerateImports(mname, { onMatch: (m) => out.push(m), onComplete: () => {} });
-    }
-  } catch {}
-  return out;
+function nf(name, ret, args) {
+  const a = resolveExport(name);
+  return a ? new NativeFunction(a, ret, args) : null;
 }
 
-// ---------- OpenSSL helper 심볼 (동적) ----------
-let _klen = null, _getCipher = null;
-function bindKeyLen() {
-  if (_klen) return _klen;
-  try {
-    const a = Module.findExportByName("libcrypto.so.3", "EVP_CIPHER_key_length") ||
-              Module.findExportByName(null, "EVP_CIPHER_key_length");
-    if (!a) return null;
-    _klen = new NativeFunction(a, "int", ["pointer"]);
-  } catch (e) { warn("bind EVP_CIPHER_key_length: " + e.message); }
-  return _klen;
-}
-function bindGetCipher() {
-  if (_getCipher) return _getCipher;
-  try {
-    const a = Module.findExportByName("libcrypto.so.3", "EVP_CIPHER_CTX_get0_cipher") ||
-              Module.findExportByName(null, "EVP_CIPHER_CTX_get0_cipher");
-    if (!a) return null;
-    _getCipher = new NativeFunction(a, "pointer", ["pointer"]);
-  } catch (e) { warn("bind EVP_CIPHER_CTX_get0_cipher: " + e.message); }
-  return _getCipher;
+// ---- OpenSSL helper APIs ----
+const EVP_CTX_get0_cipher =
+  nf("EVP_CIPHER_CTX_get0_cipher", "pointer", ["pointer"]) ||
+  nf("EVP_CIPHER_CTX_cipher",      "pointer", ["pointer"]);
+const EVP_CIPHER_get_key_length = nf("EVP_CIPHER_get_key_length", "int", ["pointer"]);
+const EVP_CIPHER_CTX_key_length = nf("EVP_CIPHER_CTX_key_length", "int", ["pointer"]);
+
+function getKeyLenFromCtx(ctx) {
+  let keyLen = -1;
+  if (EVP_CIPHER_CTX_key_length) {
+    try { keyLen = EVP_CIPHER_CTX_key_length(ctx); } catch (_) {}
+  }
+  if ((keyLen <= 0) && EVP_CTX_get0_cipher && EVP_CIPHER_get_key_length) {
+    try {
+      const c = EVP_CTX_get0_cipher(ctx);
+      if (c && !c.isNull()) keyLen = EVP_CIPHER_get_key_length(c);
+    } catch (_) {}
+  }
+  return keyLen;
 }
 
-function attachCommon(addr, name) {
-  if (!addr) return false;
-  Interceptor.attach(addr, {
+// ---- attach helpers ----
+function attachAll(name, handlerFactory) {
+  let attached = 0;
+
+  // A) 정확한 익스포트/주소
+  const addr = resolveExport(name);
+  if (addr) {
+    try {
+      Interceptor.attach(addr, handlerFactory(name));
+      info({ event: "hook_attached", func: name, where: String(addr) });
+      attached++;
+    } catch (e) { warn(`attach ${name} failed: ${e.message}`); }
+  }
+
+  if (!attached) warn(`no address for ${name}`);
+  return attached;
+}
+
+function makeInitHandler(funcName) {
+  return {
     onEnter(args) {
       const ctx = args[0];
-      let cipher = args[1] || ptr(0);
+      if (!ctx || ctx.isNull()) return;
 
-      const getC = bindGetCipher();
-      if ((cipher.isNull && cipher.isNull()) && getC) {
-        try { cipher = getC(ctx); } catch {}
+      const keyLen = getKeyLenFromCtx(ctx);
+      let encFlag = null; // EVP_CipherInit_ex 전용
+      if (funcName === "EVP_CipherInit_ex") {
+        try { encFlag = args[5].toInt32(); } catch (_) {}
       }
 
-      let keyLen = -1;
-      const kf = bindKeyLen();
-      if (cipher && (!cipher.isNull || cipher.toString() !== "0x0") && kf) {
-        try { keyLen = kf(cipher); } catch { keyLen = -1; }
-      }
-
-      write({ ts: now(), event: "keylen", func: name, pid: Process.id, tid: Thread.id, key_len: keyLen });
+      write({
+        ts: now(),
+        event: "keylen",
+        func: funcName,
+        pid: Process.id,
+        tid: this.threadId,
+        key_len_bytes: keyLen,
+        enc_flag: encFlag
+      });
     }
-  });
-  info({ event: "hook_attached", where: String(addr), func: name });
-  return true;
+  };
 }
 
-// 1) 메인 모듈 import(PLT/GOT)에서 훅
-(function attachImports() {
-  const mod = mainModule();
-  if (!mod) { warn("main module not found"); return; }
-
-  const imps = enumerateImports(mod.name) || [];
-  // 디버깅: EVP_*Init* import 전부 덤프
-  imps.forEach(imp => {
-    if (imp && imp.name && /EVP_.*Init/.test(imp.name)) {
-      info({ event: "import_dbg", name: imp.name, module: imp.module || "", addr: imp.address ? String(ptr(imp.address)) : "" });
+function makeSetKeyLenHandler(funcName) {
+  return {
+    onEnter(args) {
+      const requested = args[1] ? args[1].toInt32() : null;
+      write({
+        ts: now(),
+        event: "set_keylen_call",
+        func: funcName,
+        pid: Process.id,
+        tid: this.threadId,
+        requested_len: requested
+      });
     }
+  };
+}
+
+// ---- main ----
+(function () {
+  info({
+    event: "bindings",
+    have_ctx_keylen: !!EVP_CIPHER_CTX_key_length,
+    have_ctx_get0: !!EVP_CTX_get0_cipher,
+    have_cipher_get_keylen: !!EVP_CIPHER_get_key_length
   });
 
-  let attachedCount = 0;
-  for (const want of FUNCS) {
-    const hit = imps.find(imp => imp && imp.name && imp.name.indexOf(want) !== -1 && imp.address);
-    if (hit && attachCommon(ptr(hit.address), want)) attachedCount++;
-  }
-  info({ event: "import_attach_summary", attached: attachedCount });
-})();
+  attachAll("EVP_EncryptInit_ex2",       makeInitHandler);
+  attachAll("EVP_EncryptInit_ex",        makeInitHandler);
+  attachAll("EVP_CipherInit_ex",         makeInitHandler);
+  attachAll("EVP_CIPHER_CTX_set_key_length", makeSetKeyLenHandler);
 
-// 2) libcrypto export에서도 훅 (백업)
-(function attachExports() {
-  for (const want of FUNCS) {
-    try {
-      const a = Module.findExportByName("libcrypto.so.3", want) ||
-                Module.findExportByName(null, want);
-      if (a) attachCommon(a, want);
-    } catch {}
-  }
+  Interceptor.flush();
+  write({ ts: now(), event: "agent_ready", pid: Process.id });
 })();
-
-// 완료
-write({ ts: now(), event: "agent_ready", pid: Process.id, target_funcs: FUNCS });

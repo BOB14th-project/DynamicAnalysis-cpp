@@ -90,19 +90,17 @@ int main(int argc, char** argv) {
         return 4;
     }
 
-    // ---- frida -f 로 직접 스폰하고, %resume 파이프로 자동 재개 ----
-    // 구버전 frida는 --no-pause 미지원이라, 아래처럼 파이프를 사용
+    // ---- frida -f 로 직접 스폰하고, --no-pause 로 자동 재개 ----
     std::ostringstream cmd;
-    cmd << "/bin/sh -lc "
-        << "\"printf '%%resume\\n' | "
-        << "frida -q -f " << std::quoted(opt.target);
+    // "/bin/sh -lc " 와 "printf...|" 부분을 제거합니다.
+    cmd << "frida -q -f " << std::quoted(opt.target);
 
     for (const auto& a : opt.targetArgs) {
         cmd << " --argv=" << std::quoted(a);
     }
 
-    cmd << " -l " << std::quoted(tmpAgent.string())
-        << "\"";
+    cmd << " --l " << std::quoted(tmpAgent.string());
+    // 맨 뒤의 큰따옴표도 제거합니다.
 
     std::cerr << "[i] Running: " << cmd.str() << "\n";
     int rc = std::system(cmd.str().c_str());

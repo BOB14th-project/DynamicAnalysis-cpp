@@ -1,5 +1,8 @@
 {
     "files.associations": {
-        "iomanip": "cpp"
+        "iomanip": "cpp",
+        "filesystem": "cpp",
+        "xstring": "cpp",
+        "vector": "cpp"
     }
 }
