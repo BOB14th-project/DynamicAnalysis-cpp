@@ -1,3 +1,10 @@
+# 결과물
+/bin/
+/build/
+events.ndjson
+agent_*.js
+
+
 # Prerequisites
 *.d
 
